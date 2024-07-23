@@ -1,4 +1,4 @@
-import * as AzureOpenAI from "@azure/openai";
+import type * as AzureOpenAI from "@azure/openai";
 import {
   InstrumentationBase,
   InstrumentationConfig,
@@ -20,6 +20,8 @@ import {
   SemanticConventions,
   OpenInferenceSpanKind,
   MimeType,
+  MESSAGE_CONTENT,
+  MESSAGE_CONTENT_TYPE,
 } from "@arizeai/openinference-semantic-conventions";
 import {
   ChatRequestMessageUnion,
@@ -31,15 +33,22 @@ import {
   ChatRequestAssistantMessage,
   ChatRequestToolMessage,
   ChatRequestFunctionMessage,
+  ChatMessageContentItemUnion,
+  ChatMessageImageContentItem,
+  ChatMessageTextContentItem,
+  Completions,
 } from "@azure/openai";
-import { CompletionCreateParamsBase } from "openai/resources/completions";
-import {
-  Completion,
-  CreateEmbeddingResponse,
-  EmbeddingCreateParams,
-} from "openai/resources";
 import { assertUnreachable, isString } from "./typeUtils";
 import { isTracingSuppressed } from "@opentelemetry/core";
+import {
+  getChatCompletionLLMOutputMessagesAttributes,
+  getCompletionInputValueAndMimeType,
+  getCompletionOutputValueAndMimeType,
+  getEmbeddingTextAttributes,
+  getEmbeddingVectorAttributes,
+  getLLMInputMessagesAttributes,
+  getUsageAttributes,
+} from "./utils";
 
 const MODULE_NAME = "@azure/openai";
 
@@ -120,12 +129,11 @@ export class OpenAIInstrumentation extends InstrumentationBase<
     type ChatCompletionCreateType =
       typeof module.OpenAIClient.prototype.getChatCompletions;
 
-    // Patch create chat completions
     this._wrap(
       module.OpenAIClient.prototype,
       "getChatCompletions",
-      (original: ChatCompletionCreateType): any => {
-        return function patchedCreate(
+      (original: ChatCompletionCreateType) => {
+        return function patchedGetChatCompletions(
           this: unknown,
           ...args: Parameters<ChatCompletionCreateType>
         ) {
@@ -171,62 +179,54 @@ export class OpenAIInstrumentation extends InstrumentationBase<
             },
           );
           const wrappedPromise = execPromise.then((result) => {
-              // Record the results
-              span.setAttributes({
-                [SemanticConventions.OUTPUT_VALUE]: JSON.stringify(result),
-                [SemanticConventions.OUTPUT_MIME_TYPE]: MimeType.JSON,
-                // Override the model from the value sent by the server
-                [SemanticConventions.LLM_MODEL_NAME]: result.,
-                ...getChatCompletionLLMOutputMessagesAttributes(result),
-                ...getUsageAttributes(result),
-              });
-              span.setStatus({ code: SpanStatusCode.OK });
-              span.end();
-           
+            // Record the results
+            span.setAttributes({
+              [SemanticConventions.OUTPUT_VALUE]: JSON.stringify(result),
+              [SemanticConventions.OUTPUT_MIME_TYPE]: MimeType.JSON,
+              ...getChatCompletionLLMOutputMessagesAttributes(result),
+              ...getUsageAttributes(result),
+            });
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
+            return result;
           });
           return context.bind(execContext, wrappedPromise);
         };
       },
     );
 
-    // Patch create completions
-    type CompletionsCreateType =
-      typeof module.OpenAI.Completions.prototype.create;
-
     this._wrap(
-      module.OpenAI.Completions.prototype,
-      "create",
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (original: CompletionsCreateType): any => {
-        return function patchedCreate(
-          this: unknown,
-          ...args: Parameters<CompletionsCreateType>
-        ) {
-          const body = args[0];
-          const { prompt: _prompt, ...invocationParameters } = body;
-          const span = instrumentation.tracer.startSpan(`OpenAI Completions`, {
-            kind: SpanKind.INTERNAL,
-            attributes: {
-              [SemanticConventions.OPENINFERENCE_SPAN_KIND]:
-                OpenInferenceSpanKind.LLM,
-              [SemanticConventions.LLM_MODEL_NAME]: body.model,
-              [SemanticConventions.LLM_INVOCATION_PARAMETERS]:
-                JSON.stringify(invocationParameters),
-              ...getCompletionInputValueAndMimeType(body),
+      module.OpenAIClient.prototype,
+      "streamChatCompletions",
+      (original) => {
+        return function patchedStreamChatCompletions(this: unknown, ...args) {
+          const deploymentName = args[0];
+          const messages = args[1];
+          const options = args[2];
+          const span = instrumentation.tracer.startSpan(
+            `Azure OpenAI Stream Chat Completions`,
+            {
+              kind: SpanKind.INTERNAL,
+              attributes: {
+                [SemanticConventions.OPENINFERENCE_SPAN_KIND]:
+                  OpenInferenceSpanKind.LLM,
+                [SemanticConventions.LLM_MODEL_NAME]: deploymentName,
+                [SemanticConventions.INPUT_VALUE]: JSON.stringify(messages),
+                [SemanticConventions.INPUT_MIME_TYPE]: MimeType.JSON,
+                [SemanticConventions.LLM_INVOCATION_PARAMETERS]:
+                  JSON.stringify(options),
+                ...getLLMInputMessagesAttributes(messages),
+              },
             },
-          });
+          );
           const execContext = getExecContext(span);
-
-          const execPromise = safeExecuteInTheMiddle<
-            ReturnType<CompletionsCreateType>
-          >(
+          const execPromise = safeExecuteInTheMiddle(
             () => {
               return context.with(execContext, () => {
                 return original.apply(this, args);
               });
             },
             (error) => {
-              // Push the error to the span
               if (error) {
                 span.recordException(error);
                 span.setStatus({
@@ -238,19 +238,13 @@ export class OpenAIInstrumentation extends InstrumentationBase<
             },
           );
           const wrappedPromise = execPromise.then((result) => {
-            if (isCompletionResponse(result)) {
-              // Record the results
-              span.setAttributes({
-                [SemanticConventions.OUTPUT_VALUE]: JSON.stringify(result),
-                [SemanticConventions.OUTPUT_MIME_TYPE]: MimeType.JSON,
-                // Override the model from the value sent by the server
-                [SemanticConventions.LLM_MODEL_NAME]: result.model,
-                ...getCompletionOutputValueAndMimeType(result),
-                ...getUsageAttributes(result),
-              });
-              span.setStatus({ code: SpanStatusCode.OK });
-              span.end();
-            }
+            const [leftStream, rightStream] = result;
+            span.setAttributes({
+              ...getCompletionOutputValueAndMimeType(result),
+              ...getUsageAttributes(result),
+            });
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
             return result;
           });
           return context.bind(execContext, wrappedPromise);
@@ -258,34 +252,77 @@ export class OpenAIInstrumentation extends InstrumentationBase<
       },
     );
 
+    this._wrap(module.OpenAIClient.prototype, "getCompletions", (original) => {
+      return function patchedGetCompletions(this: unknown, ...args) {
+        const deploymentName = args[0];
+        const prompts = args[1];
+        const options = args[2];
+        const span = instrumentation.tracer.startSpan(`OpenAI Completions`, {
+          kind: SpanKind.INTERNAL,
+          attributes: {
+            [SemanticConventions.OPENINFERENCE_SPAN_KIND]:
+              OpenInferenceSpanKind.LLM,
+            [SemanticConventions.LLM_MODEL_NAME]: deploymentName,
+            [SemanticConventions.LLM_INVOCATION_PARAMETERS]:
+              JSON.stringify(options),
+            ...getCompletionInputValueAndMimeType(prompts),
+          },
+        });
+        const execContext = getExecContext(span);
+
+        const execPromise = safeExecuteInTheMiddle(
+          () => {
+            return context.with(execContext, () => {
+              return original.apply(this, args);
+            });
+          },
+          (error) => {
+            // Push the error to the span
+            if (error) {
+              span.recordException(error);
+              span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: error.message,
+              });
+              span.end();
+            }
+          },
+        );
+        const wrappedPromise = execPromise.then((result) => {
+          span.setAttributes({
+            ...getCompletionOutputValueAndMimeType(result),
+            ...getUsageAttributes(result),
+          });
+          span.setStatus({ code: SpanStatusCode.OK });
+          span.end();
+          return result;
+        });
+        return context.bind(execContext, wrappedPromise);
+      };
+    });
+
     // Patch embeddings
     type EmbeddingsCreateType =
-      typeof module.OpenAI.Embeddings.prototype.create;
+      typeof module.OpenAIClient.prototype.getEmbeddings;
     this._wrap(
-      module.OpenAI.Embeddings.prototype,
-      "create",
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (original: EmbeddingsCreateType): any => {
+      module.OpenAIClient.prototype,
+      "getEmbeddings",
+      (original: EmbeddingsCreateType) => {
         return function patchedEmbeddingCreate(
           this: unknown,
           ...args: Parameters<EmbeddingsCreateType>
         ) {
-          const body = args[0];
-          const { input } = body;
-          const isStringInput = typeof input === "string";
+          const deploymentName = args[0];
+          const input = args[1];
           const span = instrumentation.tracer.startSpan(`OpenAI Embeddings`, {
             kind: SpanKind.INTERNAL,
             attributes: {
               [SemanticConventions.OPENINFERENCE_SPAN_KIND]:
                 OpenInferenceSpanKind.EMBEDDING,
-              [SemanticConventions.EMBEDDING_MODEL_NAME]: body.model,
-              [SemanticConventions.INPUT_VALUE]: isStringInput
-                ? input
-                : JSON.stringify(input),
-              [SemanticConventions.INPUT_MIME_TYPE]: isStringInput
-                ? MimeType.TEXT
-                : MimeType.JSON,
-              ...getEmbeddingTextAttributes(body),
+              [SemanticConventions.EMBEDDING_MODEL_NAME]: deploymentName,
+              [SemanticConventions.INPUT_VALUE]: JSON.stringify(input),
+              [SemanticConventions.INPUT_MIME_TYPE]: MimeType.JSON,
+              ...getEmbeddingTextAttributes(input),
             },
           });
           const execContext = getExecContext(span);
@@ -311,10 +348,8 @@ export class OpenAIInstrumentation extends InstrumentationBase<
           );
           const wrappedPromise = execPromise.then((result) => {
             if (result) {
-              // Record the results
               span.setAttributes({
-                // Do not record the output data as it can be large
-                ...getEmbeddingEmbeddingsAttributes(result),
+                ...getEmbeddingVectorAttributes(result),
               });
             }
             span.setStatus({ code: SpanStatusCode.OK });
@@ -340,7 +375,7 @@ export class OpenAIInstrumentation extends InstrumentationBase<
    * Un-patches the OpenAI module's chat completions API
    */
   private unpatch(
-    moduleExports: typeof openai & { openInferencePatched?: boolean },
+    moduleExports: typeof AzureOpenAI & { openInferencePatched?: boolean },
     moduleVersion?: string,
   ) {
     diag.debug(`Removing patch for ${MODULE_NAME}@${moduleVersion}`);
@@ -365,264 +400,6 @@ function isChatCompletionResponse(
   response: Stream<ChatCompletions> | ChatCompletions,
 ): response is ChatCompletions {
   return "choices" in response;
-}
-
-/**
- * type-guard that checks if the response is a completion response
- */
-function isCompletionResponse(
-  response: Stream<Completion> | Completion,
-): response is Completion {
-  return "choices" in response;
-}
-
-/**
- * type-guard that checks if completion prompt attribute is an array of strings
- */
-function isPromptStringArray(
-  prompt: CompletionCreateParamsBase["prompt"],
-): prompt is Array<string> {
-  return (
-    Array.isArray(prompt) && prompt.every((item) => typeof item === "string")
-  );
-}
-
-/**
- * Converts the body of a chat completions request to LLM input messages
- */
-function getLLMInputMessagesAttributes(
-  messages: ChatRequestMessageUnion[],
-): Attributes {
-  return messages.reduce((acc, message, index) => {
-    const messageAttributes = getChatCompletionInputMessageAttributes(message);
-    const indexPrefix = `${SemanticConventions.LLM_INPUT_MESSAGES}.${index}.`;
-    // Flatten the attributes on the index prefix
-    for (const [key, value] of Object.entries(messageAttributes)) {
-      acc[`${indexPrefix}${key}`] = value;
-    }
-    return acc;
-  }, {} as Attributes);
-}
-
-type MessageWithContent =ChatRequestSystemMessage | ChatRequestUserMessage | ChatRequestAssistantMessage | ChatRequestToolMessage | ChatRequestFunctionMessage;
-
-function isMessageWithContent(message: ChatRequestMessageUnion): message is MessageWithContent {
-  return (message as MessageWithContent).content != null;
-}
-
-function getChatCompletionInputMessageAttributes(
-  message: ChatRequestMessageUnion,
-): Attributes {
-  const role = message.role;
-  const attributes: Attributes = {
-    [SemanticConventions.MESSAGE_ROLE]: role,
-  };
-  
-  if (!isMessageWithContent(message)) {
-    return attributes;
-  }
-  if (typeof message.content === "string") {
-  attributes[SemanticConventions.MESSAGE_CONTENT] = message.content; 
-  }
-
- 
-  // Add the content only if it is a string
-  switch (message.role) {
-    case "user":
-      message.role;
-
-      // There's nothing to add for the user
-      break;
-    case "assistant":
-      if (message.tool_calls) {
-        message.tool_calls.forEach((toolCall, index) => {
-          // Make sure the tool call has a function
-          if (toolCall.function) {
-            const toolCallIndexPrefix = `${SemanticConventions.MESSAGE_TOOL_CALLS}.${index}.`;
-            attributes[
-              toolCallIndexPrefix + SemanticConventions.TOOL_CALL_FUNCTION_NAME
-            ] = toolCall.function.name;
-            attributes[
-              toolCallIndexPrefix +
-                SemanticConventions.TOOL_CALL_FUNCTION_ARGUMENTS_JSON
-            ] = toolCall.function.arguments;
-          }
-        });
-      }
-      break;
-    case "function":
-      attributes[SemanticConventions.MESSAGE_FUNCTION_CALL_NAME] = message.name;
-      break;
-    case "tool":
-      // There's nothing to add for the tool. There is a tool_id, but there are no
-      // semantic conventions for it
-      break;
-    case "system":
-      // There's nothing to add for the system. Content is captured above
-      break;
-    default:
-      assertUnreachable(role);
-      break;
-  }
-  return attributes;
-}
-
-/**
- * Converts the body of a completions request to input attributes
- */
-function getCompletionInputValueAndMimeType(
-  body: CompletionCreateParamsBase,
-): Attributes {
-  if (typeof body.prompt === "string") {
-    return {
-      [SemanticConventions.INPUT_VALUE]: body.prompt,
-      [SemanticConventions.INPUT_MIME_TYPE]: MimeType.TEXT,
-    };
-  } else if (isPromptStringArray(body.prompt)) {
-    const prompt = body.prompt[0]; // Only single prompts are currently supported
-    if (prompt === undefined) {
-      return {};
-    }
-    return {
-      [SemanticConventions.INPUT_VALUE]: prompt,
-      [SemanticConventions.INPUT_MIME_TYPE]: MimeType.TEXT,
-    };
-  }
-  // Other cases in which the prompt is a token or array of tokens are currently unsupported
-  return {};
-}
-
-/**
- * Get usage attributes
- */
-function getUsageAttributes(
-  completion: ChatCompletion | Completion,
-): Attributes {
-  if (completion.usage) {
-    return {
-      [SemanticConventions.LLM_TOKEN_COUNT_COMPLETION]:
-        completion.usage.completion_tokens,
-      [SemanticConventions.LLM_TOKEN_COUNT_PROMPT]:
-        completion.usage.prompt_tokens,
-      [SemanticConventions.LLM_TOKEN_COUNT_TOTAL]:
-        completion.usage.total_tokens,
-    };
-  }
-  return {};
-}
-
-/**
- * Converts the chat completion result to LLM output attributes
- */
-function getChatCompletionLLMOutputMessagesAttributes(
-  chatCompletion: ChatCompletions,
-): Attributes {
-  // Right now support just the first choice
-  const choice = chatCompletion.choices[0];
-  if (!choice) {
-    return {};
-  }
-  return [choice.message].filter((message) => message != null).reduce((acc, message, index) => {
-    const indexPrefix = `${SemanticConventions.LLM_OUTPUT_MESSAGES}.${index}.`;
-    const messageAttributes = getChatCompletionOutputMessageAttributes(message);
-    // Flatten the attributes on the index prefix
-    for (const [key, value] of Object.entries(messageAttributes)) {
-      acc[`${indexPrefix}${key}`] = value;
-    }
-    return acc;
-  }, {} as Attributes);
-}
-
-function getChatCompletionOutputMessageAttributes(
-  message: AzureOpenAI.ChatResponseMessage,
-): Attributes {
-  const role = message.role;
-  const attributes: Attributes = {
-    [SemanticConventions.MESSAGE_ROLE]: role,
-  };
-  if (message.content) {
-    attributes[SemanticConventions.MESSAGE_CONTENT] = message.content;
-  }
-  if (message.toolCalls) {
-    message.toolCalls.forEach((toolCall, index) => {
-      const toolCallIndexPrefix = `${SemanticConventions.MESSAGE_TOOL_CALLS}.${index}.`;
-      // Double check that the tool call has a function
-      // NB: OpenAI only supports tool calls with functions right now but this may change
-      if (toolCall.) {
-        attributes[
-          toolCallIndexPrefix + SemanticConventions.TOOL_CALL_FUNCTION_NAME
-        ] = toolCall.function.name;
-        attributes[
-          toolCallIndexPrefix +
-            SemanticConventions.TOOL_CALL_FUNCTION_ARGUMENTS_JSON
-        ] = toolCall.function.arguments;
-      }
-    });
-  }
-  if (message.function_call) {
-    attributes[SemanticConventions.MESSAGE_FUNCTION_CALL_NAME] =
-      message.function_call.name;
-    attributes[SemanticConventions.MESSAGE_FUNCTION_CALL_ARGUMENTS_JSON] =
-      message.function_call.arguments;
-  }
-  return attributes;
-}
-
-/**
- * Converts the completion result to output attributes
- */
-function getCompletionOutputValueAndMimeType(
-  completion: Completion,
-): Attributes {
-  // Right now support just the first choice
-  const choice = completion.choices[0];
-  if (!choice) {
-    return {};
-  }
-  return {
-    [SemanticConventions.OUTPUT_VALUE]: String(choice.text),
-    [SemanticConventions.OUTPUT_MIME_TYPE]: MimeType.TEXT,
-  };
-}
-
-/**
- * Converts the embedding result payload to embedding attributes
- */
-function getEmbeddingTextAttributes(
-  request: EmbeddingCreateParams,
-): Attributes {
-  if (typeof request.input === "string") {
-    return {
-      [`${SemanticConventions.EMBEDDING_EMBEDDINGS}.0.${SemanticConventions.EMBEDDING_TEXT}`]:
-        request.input,
-    };
-  } else if (
-    Array.isArray(request.input) &&
-    request.input.length > 0 &&
-    typeof request.input[0] === "string"
-  ) {
-    return request.input.reduce((acc, input, index) => {
-      const indexPrefix = `${SemanticConventions.EMBEDDING_EMBEDDINGS}.${index}.`;
-      acc[`${indexPrefix}${SemanticConventions.EMBEDDING_TEXT}`] = input;
-      return acc;
-    }, {} as Attributes);
-  }
-  // Ignore other cases where input is a number or an array of numbers
-  return {};
-}
-
-/**
- * Converts the embedding result payload to embedding attributes
- */
-function getEmbeddingEmbeddingsAttributes(
-  response: CreateEmbeddingResponse,
-): Attributes {
-  return response.data.reduce((acc, embedding, index) => {
-    const indexPrefix = `${SemanticConventions.EMBEDDING_EMBEDDINGS}.${index}.`;
-    acc[`${indexPrefix}${SemanticConventions.EMBEDDING_VECTOR}`] =
-      embedding.embedding;
-    return acc;
-  }, {} as Attributes);
 }
 
 /**
