@@ -1,5 +1,11 @@
 # @arizeai/openinference-vercel
 
+## 1.1.0
+
+### Minor Changes
+
+- a96fbd5: Add readme documentation
+
 ## 1.0.0
 
 ### Major Changes
